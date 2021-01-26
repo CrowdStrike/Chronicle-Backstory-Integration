@@ -1,21 +1,19 @@
 '''
 Copyright CrowdStrike 2020. See LICENSE for more information.
 '''
-import hashlib
-import os
-import base64
-import time
-import datetime
-import requests
-import json
-import threading
-import traceback
-import signal
-import urllib
-import socket
-import logging    
+from os import _exit
+from os import path
+from time import time, sleep
+from datetime import datetime
+from requests import request, get
+from json import dumps, dump, loads, load
+from threading import Thread
+from signal import signal, SIGINT
+from urllib.parse import quote
+from socket import gethostname
+from logging import basicConfig, error, DEBUG
 
-logging.basicConfig(filename='crowdstrike-chronicle-client-logs.log', encoding='utf-8', level=logging.DEBUG)
+basicConfig(filename='crowdstrike-chronicle-client-logs.log', level=DEBUG)
 
 class ChronicleClient():
     def __init__(self):
@@ -31,58 +29,60 @@ class ChronicleClient():
         # define signal interrupt code
         def signal_handler(sig, frame):
             self.handle_exit(0, "exiting...")
-        signal.signal(signal.SIGINT, signal_handler)
+        signal(SIGINT, signal_handler)
         print('ctrl+c to quit')
         # call main function
         self.main()
     
     def get_streams(self):
         try:
+            attempt = 0
             # init
             appId = "ChronicleClient"
             discoverURL = "https://api.crowdstrike.com:443/sensors/entities/datafeed/v2?appId=" + appId
             headers = {'Authorization': 'bearer ' + self.token, 'Accept': 'application/json'}
             # parse response
-            r = requests.get(discoverURL, headers=headers)
+            r = get(discoverURL, headers=headers)
             # log api errors to chronicle
-            if (int(r.status_code)>=400): 
-                self.log_CS_error_to_chronicle(r.json())
+            while (r.status_code>=400): 
+                attempt += 1
+                if (attempt > 2): 
+                    self.handle_exit(1, "error discovering streams")
+                self.log_to_chronicle(r.json(), self.map_error_to_udm)
+                error("error discovering streams, retrying in 1 minute: " + r.text)
+                sleep(60)
+                r = get(discoverURL, headers=headers)
             response = r.json()
             return response
         except:
-            self.handle_exit(1, "unable to discover streams")
+            self.handle_exit(1, "error discovering streams")
 
     def handle_exit(self, code, message):
         if (code == 1):
-            logging.error(message)
+            error(message)
         if (self.streamsStarted):
             try:
                 with open('offset.json', 'w') as f:
-                    json.dump(self.offsets, f)
+                    dump(self.offsets, f)
             except:
-                logging.error("offset.json not found")
-        os._exit(code)
+                error("offset.json not found")
+        _exit(code)
 
-    def log_detection_to_chronicle_udm(self, obj):
-        try:      
+    def log_to_chronicle(self, response, mapper):
+        try:
+            attempt = 0      
             headers = {'Content-Type':'application/json'}
-            payload = {"events":[self.map_detection_to_udm(obj)]}
-            r = requests.request("POST", "https://malachiteingestion-pa.googleapis.com/v1/udmevents?key=" + self.googleSecKey, data = json.dumps(payload), headers=headers)
-            if (r.status_code>=400):
-                logging.error("error logging to chronicle: " + r.text)
+            payload = {"events":[mapper(response)]}
+            r = request("POST", "https://malachiteingestion-pa.googleapis.com/v1/udmevents?key=" + self.googleSecKey, data = dumps(payload), headers=headers)
+            while (r.status_code>=400):
+                attempt += 1
+                if (attempt > 2):
+                    self.handle_exit(1, "error logging to chronicle")
+                error("error logging to chronicle, retrying in 10 seconds: " + r.text)
+                sleep(10)
+                r = request("POST", "https://malachiteingestion-pa.googleapis.com/v1/udmevents?key=" + self.googleSecKey, data = dumps(payload), headers=headers)
         except:
-            self.handle_exit(1, "unable to write to chronicle")
-
-    def log_CS_error_to_chronicle(self, response):
-        try:      
-            headers = {'Content-Type':'application/json'}
-            errorLog = self.map_error_to_udm(response)
-            payload = {"events":[errorLog]}
-            r = requests.request("POST", "https://malachiteingestion-pa.googleapis.com/v1/udmevents?key=" + self.googleSecKey, data = json.dumps(payload), headers=headers)
-            if (r.status_code>=400):
-                logging.error("error logging to chronicle: " + r.text)
-        except:
-            self.handle_exit(1, "unable to write to chronicle")
+            self.handle_exit(1, "error logging to chronicle")
 
     def main(self):
         # get token
@@ -106,9 +106,9 @@ class ChronicleClient():
                 else:
                     offset = self.default_offset
                 # start thread
-                threads.append(threading.Thread(target=self.stream, args=(data_url, token, offset, refreshURL)))
+                threads.append(Thread(target=self.stream, args=(data_url, token, offset, refreshURL)))
                 threads[-1].start()
-                time.sleep(1)
+                sleep(1)
             for t in threads:
                 # join threads
                 t.join()
@@ -116,7 +116,7 @@ class ChronicleClient():
             self.handle_exit(1, "failed to get stream token")
 
     def map_detection_to_udm(self, detectionEvent):
-        timestampComponents = str(datetime.datetime.fromtimestamp(detectionEvent["event"]["ProcessStartTime"])).split()
+        timestampComponents = str(datetime.fromtimestamp(detectionEvent["event"]["ProcessStartTime"])).split()
         newURL = self.parse_url(detectionEvent["event"]["FalconHostLink"])
         udmResult = {
             "metadata": {
@@ -160,7 +160,7 @@ class ChronicleClient():
         return udmResult
 
     def map_error_to_udm(self, response):
-        timestampComponents = str(datetime.datetime.fromtimestamp(int(time.time()))).split()
+        timestampComponents = str(datetime.fromtimestamp(int(time()))).split()
         errorLog = {
                 "metadata": {
                     "event_timestamp": timestampComponents[0]+"T"+timestampComponents[1]+"+00:00",
@@ -171,7 +171,7 @@ class ChronicleClient():
                     "product_name": "Falcon"
                 },
                 "principal": {
-                    "hostname": socket.gethostname(),
+                    "hostname": gethostname(),
                     "ip": '127.0.0.1'
                 },
                 "target": {
@@ -184,10 +184,15 @@ class ChronicleClient():
 
     def read_offset(self):
         try:
-            with open("offset.json") as json_file:
-                self.offsets = json.load(json_file)
+            if (path.exists("offset.json")):
+                with open("offset.json") as json_file:
+                    self.offsets = load(json_file)
+            else:
+                self.offsets = {}
+                f = open("offset.json", "x")
+                dump(self.offsets, f)
         except :
-            logging.error("no offset file found")
+            error("could not open offset file")
 
     def parse_url(self, url):
         try:
@@ -196,7 +201,7 @@ class ChronicleClient():
             relevantURL = ""
             for i in range (3, len(segments)):
                 relevantURL += "/" + segments[i]
-            parsedRelevantURL = urllib.parse.quote(relevantURL, safe='')
+            parsedRelevantURL = quote(relevantURL, safe='')
             finalURL = segments[0]+"/"+segments[1]+"/"+segments[2]+"/api2/link?"+cid+"&url="+parsedRelevantURL
             return finalURL.split("_")[0]
         except: 
@@ -204,34 +209,48 @@ class ChronicleClient():
 
     def refresh_stream(self, refreshURL):
         try:
+            attempt = 0
             # send refresh request
             headers = { 'Authorization': 'bearer %s' % self.token, 'Accept': 'application/json', 'Content-Type': 'application/json' }
             payload = { 'action_name': 'refresh_active_stream_session', 'appId': 'my_app_id' }
-            r = requests.request("POST", refreshURL, data = payload, headers=headers)
+            r = request("POST", refreshURL, data = payload, headers=headers)
             # log api errors to chronicle
-            if (int(r.status_code)>=400): 
-                self.log_CS_error_to_chronicle(r.json())
+            while (r.status_code>=400): 
+                attempt += 1
+                if (attempt > 2):
+                    self.handle_exit(1, "error refreshing stream")
+                self.log_to_chronicle(r.json(), self.map_error_to_udm)
+                error("error refreshing stream, retrying in 1 minute: " + r.text)
+                sleep(60)
+                r = request("POST", refreshURL, data = payload, headers=headers)
         except:
-            self.handle_exit(1, "failed to refresh stream")
+            self.handle_exit(1, "error refreshing stream")
 
     def refresh_token(self):
         try:
+            attempt = 0
             # init 
             url = 'https://api.crowdstrike.com/oauth2/token'
             payload = 'client_id='+self.clientId+'&client_secret='+self.clientSecret
             tokenHeaders = {'content-type': 'application/x-www-form-urlencoded'}
             # parse response
-            r = requests.request("POST", url, data=payload, headers=tokenHeaders)
+            r = request("POST", url, data=payload, headers=tokenHeaders)
             # log api errors to chronicle
-            if (int(r.status_code)>=400): 
-                self.log_CS_error_to_chronicle(r.json())
+            while (r.status_code>=400): 
+                attempt += 1
+                if (attempt > 2):
+                    self.handle_exit(1, "error refreshing token")
+                self.log_to_chronicle(r.json(), self.map_error_to_udm)
+                error("error refreshing token, retrying in 1 minute: " + r.text)
+                sleep(60)
+                r = request("POST", url, data=payload, headers=tokenHeaders)
             r = r.json()
             token = r['access_token']
             self.token = token
             # set token period start time
-            self.token_period_start = time.time()
+            self.token_period_start = time()
         except:
-            self.handle_exit(1, "unable to get token")
+            self.handle_exit(1, "error refreshing token")
 
     def stream(self, url, token, offset, refreshURL):
         # @param url: the stream url
@@ -240,29 +259,43 @@ class ChronicleClient():
         # @param refreshURL: the url to refresh the stream
         try:
             # connect to stream url
-            stream_period_start = time.time()
+            attempt = 0
+            stream_period_start = time()
             requrl = url + "&offset=%s" %offset
             headers={'Authorization': 'Token %s' % token, 'Connection': 'Keep-Alive'}
-            r = requests.get(requrl, headers=headers, stream=True)
+            r = get(requrl, headers=headers, stream=True)
+            # log stream errors to chronicle
+            while (r.status_code>=400):
+                attempt += 1 
+                if (attempt > 2):
+                    self.handle_exit(1, "error connecting to stream")
+                self.log_to_chronicle(r.json(), self.map_error_to_udm)
+                error("error connecting to stream, retrying in 1 minute: " + r.text)
+                sleep(60)
+                r = get(requrl, headers=headers, stream=True)
+            # flag that streams have started
             self.streamsStarted = True
             for line in r.iter_lines():
                 # check new streams
                 if line:
                     decoded_line = line.decode('utf-8')
-                    decoded_line = json.loads(decoded_line)
+                    decoded_line = loads(decoded_line)
                     self.offsets[url] = decoded_line['metadata']['offset']
                     # log to detections to chronicle
                     if (decoded_line['metadata']['eventType'] == "DetectionSummaryEvent"):
-                        self.log_detection_to_chronicle_udm(decoded_line)
+                        self.log_to_chronicle(decoded_line, self.map_detection_to_udm)
                 # refresh stream after 25 minutes
-                if (time.time() - stream_period_start >= 1500):
-                    stream_period_start = time.time()
+                if (time() - stream_period_start >= 1500):
+                    stream_period_start = time()
                     self.refresh_stream(refreshURL)
                 # refresh token after 25 minutes
-                if (time.time() - self.token_period_start >= 1500):
+                if (time() - self.token_period_start >= 1500):
                     self.refresh_token()
         except: 
             self.handle_exit(1, "error reading last stream chunk")
 
-# start Chronicle Client class
-ChronicleClient()
+def main():
+    ChronicleClient()
+
+if __name__ == "__main__":
+    main()
