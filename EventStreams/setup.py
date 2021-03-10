@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
     name="chronicle-client",
     version="1.0",
-    scripts=['chronicleclient.py'],
+    scripts=['src/chronicleclient.py'],
     install_requires=[
         'requests'
     ],
@@ -11,5 +11,5 @@ setup(
     'console_scripts': [
         'chronicle-client=chronicleclient:main',
     ]
-    } 
+    }
 )
